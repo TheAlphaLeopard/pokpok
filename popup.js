@@ -36,3 +36,28 @@ document.getElementById('setSpeak').addEventListener('click', async ()=>{
     }, 200);
   });
 });
+
+// Send bundled `download.wav` from extension package to the page for testing
+document.getElementById('test').addEventListener('click', async ()=>{
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tabs || !tabs[0]) return alert('No active tab');
+  const tabId = tabs[0].id;
+
+  try{
+    const url = chrome.runtime.getURL('download.wav');
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Failed to fetch download.wav: ' + res.status);
+    const blob = await res.blob();
+    chrome.tabs.sendMessage(tabId, { type: 'setTTSBlob', blob }, (resp) => {
+      if (chrome.runtime.lastError) console.warn('setTTSBlob error', chrome.runtime.lastError.message);
+      setTimeout(() => {
+        chrome.tabs.sendMessage(tabId, { type: 'playTTS' }, (r2) => {
+          if (chrome.runtime.lastError) console.warn('playTTS error:', chrome.runtime.lastError.message);
+        });
+      }, 200);
+    });
+  } catch (e){
+    console.error('Could not send test audio', e);
+    alert('Could not send test audio: ' + e.message);
+  }
+});

@@ -82,6 +82,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // indicate async response
     return true;
   }
+  if (msg.type === 'setTTSBlob'){
+    try{
+      const blob = msg.blob;
+      if (!blob) return sendResponse({ ok: false, error: 'no blob' });
+      window.postMessage({ direction: 'from-extension', type: 'setTTS', blob }, '*');
+      sendResponse({ ok: true });
+    } catch (e){
+      console.error('Failed to forward TTS blob from popup', e);
+      sendResponse({ ok: false, error: String(e) });
+    }
+    return true;
+  }
   if (msg.type === 'playTTS'){
     window.postMessage({ direction: 'from-extension', type: 'playTTS' }, '*');
     sendResponse({ ok: true });
