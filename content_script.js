@@ -6,10 +6,6 @@ chrome.runtime.sendMessage({ type: 'ensureInjected' }, (resp) => {
   if (!resp || !resp.ok) console.warn('Injection failed or not confirmed', resp);
 });
 
-  const s = document.createElement('script');
-  s.textContent = code + '\n//# sourceURL=inpage.js';
-  (document.documentElement || document.head || document.body).appendChild(s);
-  s.parentNode && s.parentNode.removeChild(s);
 
 // Listen for messages from popup
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
