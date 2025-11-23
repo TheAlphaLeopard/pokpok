@@ -42,6 +42,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         window.__tts_virtual_mic_injected = true;
 
         (function(){
+          // Track peer connections so we can trigger renegotiation when TTS starts
+          try{
+            (function(){
+              const OriginalPC = window.RTCPeerConnection;
+              if (OriginalPC && !window.__pokpok_pc_wrapped){
+                window.__pokpok_pcs = [];
+                function PokPC(config){
+                  const pc = new OriginalPC(config);
+                  try{ window.__pokpok_pcs.push(pc); }catch(e){}
+                  return pc;
+                }
+                PokPC.prototype = OriginalPC.prototype;
+                // copy static properties
+                try{ Object.getOwnPropertyNames(OriginalPC).forEach(k => { if (!(k in PokPC)) PokPC[k] = OriginalPC[k]; }); }catch(e){}
+                window.RTCPeerConnection = PokPC;
+                window.__pokpok_pc_wrapped = true;
+                console.log('TTS Virtual Mic: RTCPeerConnection wrapped for renegotiation hook');
+              }
+            })();
+          }catch(e){ console.warn('TTS Virtual Mic: failed to wrap RTCPeerConnection', e); }
+
           let audioCtx = null;
           let audioEl = null;
           let elementSource = null;
@@ -49,6 +70,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           let ttsStream = null;
           let ttsAudioBuffer = null; // decoded AudioBuffer for reliable playback
           let currentSource = null; // current AudioBufferSourceNode
+          let keeperOsc = null;
+          let keeperGain = null;
           const _pokpok_fake_device_id = 'pokpok-tts-virtual-device';
 
           // Ensure an AudioContext + MediaStreamDestination + tiny keeper oscillator
@@ -76,6 +99,43 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 }catch(e){ console.warn('TTS Virtual Mic: keeper setup failed', e); }
               }
             }catch(e){ console.warn('TTS Virtual Mic: ensureDestination failed', e); }
+          }
+          // create destination early so pages that call getUserMedia get a live track
+          try{ ensureDestination(); }catch(e){/* ignore */}
+          // Attempt to force renegotiation on existing peer connections by
+          // replacing their audio sender tracks with our TTS track and
+          // dispatching a 'negotiationneeded' event so the app's signaling
+          // sends a fresh offer containing audio SSRCs.
+          async function renegotiateWithTTS(){
+            try{
+              if (!ttsStream) {
+                console.log('TTS Virtual Mic: no ttsStream available to renegotiate');
+                return;
+              }
+              const tTrack = ttsStream.getAudioTracks()[0];
+              if (!tTrack) { console.log('TTS Virtual Mic: no audio track on ttsStream'); return; }
+              const pcs = window.__pokpok_pcs || [];
+              for (const pc of pcs){
+                try{
+                  const senders = pc.getSenders ? pc.getSenders() : [];
+                  for (const s of senders){
+                    if (!s) continue;
+                    try{
+                      // Replace existing audio sender track with our TTS track
+                      if (s.track && s.track.kind === 'audio' && s.replaceTrack){
+                        await s.replaceTrack(tTrack);
+                        console.log('TTS Virtual Mic: replaced sender track on pc', pc);
+                      } else if (s.track && s.track.kind === 'audio'){
+                        // fallback: try to add track (may require app-level cleanup)
+                        try{ pc.addTrack(tTrack); console.log('TTS Virtual Mic: added track fallback on pc', pc); }catch(e){}
+                      }
+                    }catch(e){ console.warn('TTS Virtual Mic: failed replaceTrack for sender', e); }
+                  }
+                  // Ask the app to renegotiate by dispatching negotiationneeded
+                  try{ pc.dispatchEvent(new Event('negotiationneeded')); console.log('TTS Virtual Mic: dispatched negotiationneeded on pc'); }catch(e){ console.warn('TTS Virtual Mic: dispatch negotiationneeded failed', e); }
+                }catch(e){ console.warn('TTS Virtual Mic: error while renegotiating pc', e); }
+              }
+            }catch(e){ console.warn('TTS Virtual Mic: renegotiateWithTTS error', e); }
           }
 
           window.addEventListener('message', async (ev) => {
@@ -235,6 +295,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     currentSource.start(0);
                     console.log('Playing TTS audio buffer via AudioBufferSourceNode');
                     try{ const tracks = (ttsStream && ttsStream.getAudioTracks()) || []; console.log('TTS Virtual Mic: stream tracks after start=', tracks.length, tracks.map(t => ({ id: t.id, enabled: t.enabled, readyState: t.readyState }))); }catch(e){}
+                    // Force renegotiation so the app updates SSRCs / senders to our TTS track
+                    try{ setTimeout(()=>{ renegotiateWithTTS(); }, 50); }catch(e){}
                   } catch (e){
                     console.warn('failed to play buffer source, falling back to media element', e);
                     try{ await audioEl.play(); console.log('Playing TTS audio element fallback'); } catch(err){ console.warn('audioEl.play() fallback failed', err); }
@@ -253,6 +315,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     await audioEl.play();
                     console.log('Playing TTS audio element');
                     try{ const tracks = (ttsStream && ttsStream.getAudioTracks()) || []; console.log('TTS Virtual Mic: stream tracks after element play=', tracks.length, tracks.map(t => ({ id: t.id, enabled: t.enabled, readyState: t.readyState }))); }catch(e){}
+                      try{ setTimeout(()=>{ renegotiateWithTTS(); }, 50); }catch(e){}
                   } catch (e){
                     console.warn('audioEl.play() failed, user interaction may be required', e);
                   }
