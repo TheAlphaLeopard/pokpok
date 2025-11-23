@@ -47,13 +47,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           let elementSource = null;
           let destination = null;
           let ttsStream = null;
+          let ttsAudioBuffer = null; // decoded AudioBuffer for reliable playback
+          let currentSource = null; // current AudioBufferSourceNode
           const _pokpok_fake_device_id = 'pokpok-tts-virtual-device';
 
           window.addEventListener('message', async (ev) => {
             const m = ev.data;
             if (!m || m.direction !== 'from-extension') return;
             try{
-              if (m.type === 'setTTS'){
+                if (m.type === 'setTTS'){
                 // Accept either an ArrayBuffer (preferred), a Blob, or raw text (fallback).
                 if (m.arrayBuffer){
                   console.log('Inpage received transferred arrayBuffer, mime=', m.mime, 'arrayBuffer instanceof ArrayBuffer=', m.arrayBuffer instanceof ArrayBuffer);
@@ -77,13 +79,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     audioEl.src = objectUrl;
                     audioEl.load();
                     console.log('TTS audio element set from transferred ArrayBuffer, objectUrl=', objectUrl);
-                    // Prepare audio context and media stream destination immediately to avoid race with getUserMedia
+                    // Prepare audio context, decode ArrayBuffer into AudioBuffer and create destination
                     try{
                       if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
                       if (!destination){
                         destination = audioCtx.createMediaStreamDestination();
                         ttsStream = destination.stream;
                       }
+                      // Decode into AudioBuffer for reliable playback and routing into destination
+                      try{
+                        // Some ArrayBuffer-like objects are transferable; make a copy if necessary
+                        const raw = m.arrayBuffer.slice ? m.arrayBuffer.slice(0) : m.arrayBuffer;
+                        ttsAudioBuffer = await audioCtx.decodeAudioData(raw).catch(err => { throw err; });
+                        console.log('TTS Virtual Mic: decoded AudioBuffer, length=', ttsAudioBuffer.length);
+                      } catch (e){
+                        console.warn('decodeAudioData failed, falling back to media element source', e);
+                      }
+                      // If decode succeeded, we will play via AudioBufferSourceNode in playTTS; still create elementSource fallback
                       if (!elementSource){
                         try{
                           elementSource = audioCtx.createMediaElementSource(audioEl);
@@ -116,6 +128,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     if (!destination){
                       destination = audioCtx.createMediaStreamDestination();
                       ttsStream = destination.stream;
+                    }
+                    // Try to decode blob to AudioBuffer for reliable routing
+                    try{
+                      const ab = await m.blob.arrayBuffer();
+                      ttsAudioBuffer = await audioCtx.decodeAudioData(ab).catch(err => { throw err; });
+                      console.log('TTS Virtual Mic: decoded AudioBuffer from blob');
+                    } catch (e){
+                      console.warn('decodeAudioData from blob failed, using media element fallback', e);
                     }
                     if (!elementSource){
                       try{
@@ -159,25 +179,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                   } catch (e){ console.warn('Failed to prepare audio context on setTTS (text URL)', e); }
                 }
               } else if (m.type === 'playTTS'){
-                if (!audioEl) return console.warn('No audio element prepared');
+                if (!audioEl && !ttsAudioBuffer) return console.warn('No audio prepared (no element or decoded buffer)');
                 if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                try{ await audioCtx.resume(); } catch(e){}
                 if (!destination){
                   destination = audioCtx.createMediaStreamDestination();
                   ttsStream = destination.stream;
                 }
-                if (!elementSource){
+
+                // If we decoded an AudioBuffer, play it via an AudioBufferSourceNode (reliable for routing to destination)
+                if (ttsAudioBuffer){
                   try{
-                    elementSource = audioCtx.createMediaElementSource(audioEl);
-                    elementSource.connect(destination);
+                    if (currentSource){
+                      try{ currentSource.stop(); } catch(e){}
+                      currentSource = null;
+                    }
+                    currentSource = audioCtx.createBufferSource();
+                    currentSource.buffer = ttsAudioBuffer;
+                    currentSource.connect(destination);
+                    // also connect to output so user can hear it locally if desired
+                    try{ currentSource.connect(audioCtx.destination); } catch(e){}
+                    currentSource.start(0);
+                    console.log('Playing TTS audio buffer via AudioBufferSourceNode');
                   } catch (e){
-                    console.warn('createMediaElementSource failed', e);
+                    console.warn('failed to play buffer source, falling back to media element', e);
+                    try{ await audioEl.play(); console.log('Playing TTS audio element fallback'); } catch(err){ console.warn('audioEl.play() fallback failed', err); }
                   }
-                }
-                try{
-                  await audioEl.play();
-                  console.log('Playing TTS audio element');
-                } catch (e){
-                  console.warn('audioEl.play() failed, user interaction may be required', e);
+                } else {
+                  // fallback to media element playback
+                  if (!elementSource){
+                    try{
+                      elementSource = audioCtx.createMediaElementSource(audioEl);
+                      elementSource.connect(destination);
+                    } catch (e){
+                      console.warn('createMediaElementSource failed', e);
+                    }
+                  }
+                  try{
+                    await audioEl.play();
+                    console.log('Playing TTS audio element');
+                  } catch (e){
+                    console.warn('audioEl.play() failed, user interaction may be required', e);
+                  }
                 }
               }
             } catch (e){ console.error('Inpage handling error', e); }
