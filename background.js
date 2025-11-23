@@ -72,6 +72,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           let currentSource = null; // current AudioBufferSourceNode
           let keeperOsc = null;
           let keeperGain = null;
+          let audioCtxBlocked = false;
+          let dummyStream = null;
           const _pokpok_fake_device_id = 'pokpok-tts-virtual-device';
 
           // Ensure an AudioContext + MediaStreamDestination + tiny keeper oscillator
@@ -79,9 +81,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // even if no TTS audio has been set yet. This avoids negotiation races
           // where WebRTC reports 0 audio SSRCs.
           function ensureDestination(){
+            // Try to create AudioContext/destination; if creation is blocked by autoplay policies,
+            // set audioCtxBlocked and arrange to create on next user gesture.
             try{
-              if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-              if (!destination){
+              if (!audioCtx){
+                try{
+                  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                } catch (err){
+                  console.warn('TTS Virtual Mic: AudioContext creation blocked, will wait for user gesture', err);
+                  audioCtxBlocked = true;
+                }
+              }
+
+              if (audioCtx && !destination){
                 destination = audioCtx.createMediaStreamDestination();
                 ttsStream = destination.stream;
                 try{
@@ -94,14 +106,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     keeperOsc.connect(keeperGain);
                     keeperGain.connect(destination);
                     try{ keeperOsc.start(); }catch(e){}
-                    console.log('TTS Virtual Mic: keeper oscillator started at injection to keep track live');
+                    console.log('TTS Virtual Mic: keeper oscillator started to keep track live');
                   }
                 }catch(e){ console.warn('TTS Virtual Mic: keeper setup failed', e); }
+                // After destination is created, attempt to renegotiate so apps pick up the new track
+                try{ setTimeout(()=>{ if (typeof renegotiateWithTTS === 'function') renegotiateWithTTS(); }, 100); }catch(e){}
               }
             }catch(e){ console.warn('TTS Virtual Mic: ensureDestination failed', e); }
           }
-          // create destination early so pages that call getUserMedia get a live track
-          try{ ensureDestination(); }catch(e){/* ignore */}
+          // Do not force-create AudioContext on injection (may be blocked); we'll create
+          // on-demand when the page requests our fake device or after a user gesture.
+          dummyStream = new MediaStream();
           // Attempt to force renegotiation on existing peer connections by
           // replacing their audio sender tracks with our TTS track and
           // dispatching a 'negotiationneeded' event so the app's signaling
@@ -153,7 +168,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                       audioEl.style.display = 'none';
                       document.body.appendChild(audioEl);
                     }
-                    try{ if (audioEl._objectUrl) URL.revokeObjectURL(audioEl._objectUrl); }catch(e){}
+                    try{
+                      if (audioEl._objectUrl){
+                        const old = audioEl._objectUrl;
+                        setTimeout(() => { try{ URL.revokeObjectURL(old); }catch(e){} }, 30 * 1000);
+                      }
+                    }catch(e){}
                     const blob = new Blob([m.arrayBuffer], { type: m.mime || 'audio/mpeg' });
                     let objectUrl;
                     try{
@@ -208,7 +228,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                     document.body.appendChild(audioEl);
                   }
                   try{
-                    if (audioEl._objectUrl) URL.revokeObjectURL(audioEl._objectUrl);
+                    if (audioEl._objectUrl){ const old = audioEl._objectUrl; setTimeout(()=>{ try{ URL.revokeObjectURL(old); }catch(e){} }, 30*1000); }
                   }catch(e){}
                   const objectUrl = URL.createObjectURL(m.blob);
                   audioEl._objectUrl = objectUrl;
@@ -348,7 +368,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 const origGet = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
                 // Resume audio context on first user gesture to satisfy autoplay policies
                 const _resumeOnGesture = async () => {
-                  try{ if (audioCtx && audioCtx.state === 'suspended') { await audioCtx.resume(); console.log('TTS Virtual Mic: audioCtx resumed via user gesture'); } }catch(e){}
+                  try{
+                    if (audioCtx && audioCtx.state === 'suspended') { await audioCtx.resume(); console.log('TTS Virtual Mic: audioCtx resumed via user gesture'); }
+                    if (audioCtxBlocked){
+                      // Try to initialize destination now that user interacted
+                      audioCtxBlocked = false;
+                      try{ ensureDestination(); console.log('TTS Virtual Mic: created destination after user gesture'); }catch(e){}
+                      // If we now have a ttsStream, renegotiate so that PCs pick up audio
+                      try{ if (ttsStream) renegotiateWithTTS(); }catch(e){}
+                    }
+                  }catch(e){}
                   document.removeEventListener('click', _resumeOnGesture);
                   document.removeEventListener('keydown', _resumeOnGesture);
                 };
@@ -369,9 +398,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                   // If the page explicitly requests the fake device, or wants audio but didn't request a different device,
                   // return our TTS MediaStream when available.
                   if (wantsAudio && (requestedDeviceId === _pokpok_fake_device_id || requestedDeviceId === null)){
+                    // Ensure AudioContext/destination if possible (may be created now because getUserMedia
+                    // is often called in a user gesture context).
+                    try{ ensureDestination(); }catch(e){}
                     if (ttsStream){
                       try{
-                        // Ensure tracks are enabled and return a cloned MediaStream containing the tracks
                         const tracks = ttsStream.getAudioTracks() || [];
                         tracks.forEach(t => { try{ t.enabled = true; }catch(e){} });
                         const cloned = new MediaStream(tracks);
@@ -382,6 +413,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                         return ttsStream;
                       }
                     }
+                    // If ttsStream isn't ready (AudioContext blocked), return a dummy empty stream so the call doesn't fail.
+                    console.log('TTS Virtual Mic: returning dummy stream for getUserMedia (ttsStream not ready)');
+                    return dummyStream;
                   }
                   return origGet(constraints);
                 };
