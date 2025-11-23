@@ -1,10 +1,17 @@
 // Inject in-page script so it runs in page context
 (function(){
+  // Inject inpage script by fetching its source and inserting inline.
+  // This avoids chrome-extension:// URL load failures and CSP blocking.
   const url = chrome.runtime.getURL('inpage.js');
-  const s = document.createElement('script');
-  s.src = url;
-  s.onload = function(){ this.remove(); };
-  (document.documentElement || document.head || document.body).appendChild(s);
+  fetch(url).then(resp => resp.text()).then(code => {
+    const s = document.createElement('script');
+    s.textContent = code + '\n//# sourceURL=' + url;
+    (document.documentElement || document.head || document.body).appendChild(s);
+    // remove after injection
+    s.parentNode && s.parentNode.removeChild(s);
+  }).catch(err => {
+    console.error('Failed to inject inpage script', err);
+  });
 })();
 
 // Listen for messages from popup
